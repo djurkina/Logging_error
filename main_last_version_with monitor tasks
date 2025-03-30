@@ -1,0 +1,602 @@
+import telebot
+from telebot import types
+import logging
+import json
+import os
+import threading
+import time
+import schedule
+from datetime import datetime
+from functools import wraps
+
+from config import TELEGRAM_TOKEN, GOOGLE_ROOT_ID
+from drive_service import (
+    extract_folder_id, extract_file_id, list_files_in_folder,
+    copy_file, move_file, delete_file, set_file_permission,
+    get_file_hierarchy
+)
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# Состояния (FSM)
+STATE_NONE = 0
+STATE_COPY_SOURCE = 1
+STATE_COPY_DEST = 2
+STATE_MOVE_FILE = 3
+STATE_MOVE_DEST = 4
+STATE_DELETE_FILE = 5
+STATE_DELETE_CONFIRM = 6
+STATE_PERM_FILE = 7
+STATE_PERM_EMAIL = 8
+STATE_PERM_ROLE = 9
+STATE_FOLDER_REPORT = 10
+STATE_CR_SOURCE = 14  # Для /changesreport (исходная папка)
+STATE_CR_DEST = 15  # Для /changesreport (целевая папка)
+
+user_states: dict[int, int] = {}
+user_data: dict[int, dict] = {}
+
+
+def set_state(user_id: int, state: int) -> None:
+    user_states[user_id] = state
+
+
+def get_state(user_id: int) -> int:
+    return user_states.get(user_id, STATE_NONE)
+
+
+def set_user_data(user_id: int, key: str, value) -> None:
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    user_data[user_id][key] = value
+
+
+def get_user_data(user_id: int, key: str, default=None):
+    return user_data.get(user_id, {}).get(key, default)
+
+
+def clear_user_data(user_id: int) -> None:
+    user_data[user_id] = {}
+
+
+# Декоратор для обработки ошибок в хэндлерах
+def handle_errors(func):
+    @wraps(func)
+    def wrapper(message):
+        try:
+            func(message)
+        except Exception as e:
+            logging.exception(f"Ошибка в {func.__name__}: {e}")
+            bot.reply_to(message, "Произошла внутренняя ошибка. Попробуйте позже или /cancel.")
+
+    return wrapper
+
+
+# Файлы для мониторинга и журнала
+MONITOR_TASKS_FILE = "monitor_tasks.json"
+CHANGES_LOG_FILE = "changes_log.json"
+
+
+def load_json_file(filepath: str) -> list:
+    if not os.path.exists(filepath):
+        return []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Ошибка чтения {filepath}: {e}")
+        return []
+
+
+def save_json_file(filepath: str, data) -> None:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка записи {filepath}: {e}")
+
+
+def load_monitor_tasks() -> list:
+    return load_json_file(MONITOR_TASKS_FILE)
+
+
+def save_monitor_tasks(tasks: list) -> None:
+    save_json_file(MONITOR_TASKS_FILE, tasks)
+
+
+def load_changes_log() -> list:
+    return load_json_file(CHANGES_LOG_FILE)
+
+
+def save_changes_log(log_data: list) -> None:
+    save_json_file(CHANGES_LOG_FILE, log_data)
+
+
+def add_change_record(operation: str, file_name: str, file_id: str, source_id: str = None, dest_id: str = None,
+                      comment: str = "") -> None:
+    log_data = load_changes_log()
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "operation": operation,
+        "file_name": file_name,
+        "file_id": file_id,
+        "source_folder_id": source_id if source_id else "",
+        "dest_folder_id": dest_id if dest_id else "",
+        "comment": comment
+    }
+    log_data.append(record)
+    save_changes_log(log_data)
+
+
+# --- Команды бота ---
+
+@bot.message_handler(commands=['start'])
+@handle_errors
+def cmd_start(message: types.Message) -> None:
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        '/copy', '/move', '/delete', '/setpermissions',
+        '/monitor', '/changesreport', '/report', '/folderreport', '/cancel'
+    )
+    bot.send_message(
+        message.chat.id,
+        "Привет! Вот список доступных команд:\n"
+        "• /copy – скопировать файлы из исходной папки в целевую (сохраняет путь для мониторинга)\n"
+        "• /move – переместить файл\n"
+        "• /delete – удалить файл\n"
+        "• /setpermissions – изменить права доступа\n"
+        "• /monitor – показать список мониторинговых задач\n"
+        "• /changesreport – добавить новую задачу мониторинга\n"
+        "• /report – получить полный отчёт по всем изменениям\n"
+        "• /folderreport – получить отчёт по папке\n"
+        "• /cancel – отменить операцию",
+        reply_markup=markup
+    )
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(commands=['cancel'])
+@handle_errors
+def cmd_cancel(message: types.Message) -> None:
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+    bot.reply_to(message, "Операция отменена.")
+
+
+# ---- /copy ----
+@bot.message_handler(commands=['copy'])
+@handle_errors
+def cmd_copy(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на исходную папку:")
+    set_state(message.chat.id, STATE_COPY_SOURCE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_COPY_SOURCE)
+@handle_errors
+def copy_source_handler(message: types.Message) -> None:
+    folder_id = extract_folder_id(message.text)
+    if not folder_id:
+        bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или /cancel.")
+        return
+    set_user_data(message.chat.id, 'source_folder_id', folder_id)
+    bot.reply_to(message, "Введите ссылку на целевую папку (или оставьте пустым для корневой):")
+    set_state(message.chat.id, STATE_COPY_DEST)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_COPY_DEST)
+@handle_errors
+def copy_dest_handler(message: types.Message) -> None:
+    chat_id = message.chat.id
+    if message.text.strip() == "":
+        dest_id = GOOGLE_ROOT_ID
+    else:
+        dest_id = extract_folder_id(message.text)
+        if not dest_id:
+            bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или /cancel.")
+            return
+    source_id = get_user_data(chat_id, 'source_folder_id')
+    files = list_files_in_folder(source_id)
+    if not files:
+        bot.reply_to(message, "В исходной папке нет файлов для копирования.")
+        set_state(chat_id, STATE_NONE)
+        clear_user_data(chat_id)
+        return
+
+    total = len(files)
+    copied_count = 0
+    # Отправляем сообщение с прогрессом копирования
+    progress_msg = bot.send_message(chat_id, f"Копирование файлов: 0 / {total}")
+    for idx, f in enumerate(files, start=1):
+        try:
+            new_file = copy_file(f["id"], f["name"], dest_id)
+            copied_count += 1
+            add_change_record(
+                operation="copy",
+                file_name=new_file["name"],
+                file_id=new_file["id"],
+                source_id=source_id,
+                dest_id=dest_id,
+                comment="Ручное копирование через /copy"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при копировании файла {f['name']}: {e}")
+        # Обновляем сообщение с прогрессом
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                text=f"Копирование файлов: {idx} / {total}"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при обновлении прогресса: {e}")
+    bot.reply_to(message, f"Копирование завершено. Скопировано файлов: {copied_count}")
+
+    # Добавляем / обновляем задачу мониторинга
+    tasks = load_monitor_tasks()
+    existing_task = None
+    for t in tasks:
+        if t["source_folder_id"] == source_id and t["dest_folder_id"] == dest_id:
+            existing_task = t
+            break
+    if existing_task is None:
+        new_task = {
+            "source_folder_id": source_id,
+            "dest_folder_id": dest_id,
+            "copied_files": [f["name"] for f in files]
+        }
+        tasks.append(new_task)
+    else:
+        for f in files:
+            if f["name"] not in existing_task["copied_files"]:
+                existing_task["copied_files"].append(f["name"])
+    save_monitor_tasks(tasks)
+    set_state(chat_id, STATE_NONE)
+    clear_user_data(chat_id)
+
+
+# ---- /monitor ----
+@bot.message_handler(commands=['monitor'])
+@handle_errors
+def cmd_monitor(message: types.Message) -> None:
+    tasks = load_monitor_tasks()
+    chat_id = message.chat.id
+    if not tasks:
+        bot.reply_to(message, "Пока нет мониторинговых задач. Используйте /copy для их создания.")
+        return
+
+    # Создаем inline-клавиатуру для выбора задачи
+    markup = types.InlineKeyboardMarkup()
+    for idx, task in enumerate(tasks, start=1):
+        btn_text = f"Задача {idx}: {task['source_folder_id']} → {task['dest_folder_id']}"
+        # Сохраняем индекс задачи в callback_data
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"monitor_{idx - 1}"))
+    bot.send_message(chat_id, "Выберите задачу для подробного отчета:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("monitor_"))
+@handle_errors
+def monitor_callback(call: types.CallbackQuery) -> None:
+    index = int(call.data.split("_")[1])
+    tasks = load_monitor_tasks()
+    if 0 <= index < len(tasks):
+        task = tasks[index]
+        text = (f"Задача мониторинга:\n"
+                f"Исходная папка: {task['source_folder_id']}\n"
+                f"Целевая папка: {task['dest_folder_id']}\n"
+                f"Скопировано файлов: {len(task.get('copied_files', []))}\n"
+                f"Файлы: {', '.join(task.get('copied_files', []))}")
+        bot.send_message(call.message.chat.id, text)
+    else:
+        bot.send_message(call.message.chat.id, "Неверная задача.")
+
+
+# ---- /changesreport ----
+@bot.message_handler(commands=['changesreport'])
+@handle_errors
+def cmd_changesreport(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на новую исходную папку для мониторинга:")
+    set_state(message.chat.id, STATE_CR_SOURCE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_CR_SOURCE)
+@handle_errors
+def cr_source_handler(message: types.Message) -> None:
+    source_id = extract_folder_id(message.text)
+    if not source_id:
+        bot.reply_to(message, "Не удалось извлечь ID исходной папки. Попробуйте ещё раз или /cancel.")
+        return
+    set_user_data(message.chat.id, 'cr_source', source_id)
+    bot.reply_to(message, "Введите ссылку на новую целевую папку (или оставьте пустым для корневой):")
+    set_state(message.chat.id, STATE_CR_DEST)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_CR_DEST)
+@handle_errors
+def cr_dest_handler(message: types.Message) -> None:
+    if message.text.strip() == "":
+        dest_id = GOOGLE_ROOT_ID
+    else:
+        dest_id = extract_folder_id(message.text)
+        if not dest_id:
+            bot.reply_to(message, "Не удалось извлечь ID целевой папки. Попробуйте ещё раз или /cancel.")
+            return
+    source_id = get_user_data(message.chat.id, 'cr_source')
+    tasks = load_monitor_tasks()
+    exists = any(t["source_folder_id"] == source_id and t["dest_folder_id"] == dest_id for t in tasks)
+    if exists:
+        bot.reply_to(message, "Задача с таким путем уже существует.")
+    else:
+        new_task = {
+            "source_folder_id": source_id,
+            "dest_folder_id": dest_id,
+            "copied_files": []
+        }
+        tasks.append(new_task)
+        save_monitor_tasks(tasks)
+        bot.reply_to(message, f"Новая задача мониторинга добавлена:\nИсходная: {source_id}\nЦелевая: {dest_id}")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+
+# ---- /report ----
+@bot.message_handler(commands=['report'])
+@handle_errors
+def cmd_report(message: types.Message) -> None:
+    changes = load_changes_log()
+    report_lines = []
+    report_lines.append("==== Полный отчёт по изменениям ====")
+    report_lines.append(f"Google ID (корневая папка): {GOOGLE_ROOT_ID}")
+    report_lines.append("\nЖурнал изменений:")
+    if changes:
+        changes_sorted = sorted(changes, key=lambda x: x["timestamp"])
+        for rec in changes_sorted:
+            line = f"{rec['timestamp']} | {rec['operation']} | Файл: {rec['file_name']} (ID: {rec['file_id']})"
+            if rec['source_folder_id']:
+                line += f" | От: {rec['source_folder_id']}"
+            if rec['dest_folder_id']:
+                line += f" | В: {rec['dest_folder_id']}"
+            if rec['comment']:
+                line += f" | {rec['comment']}"
+            report_lines.append(line)
+    else:
+        report_lines.append("Журнал изменений пуст.")
+    full_report = "\n".join(report_lines)
+    bot.reply_to(message, full_report)
+
+
+# ---- /folderreport ----
+@bot.message_handler(commands=['folderreport'])
+@handle_errors
+def cmd_folderreport(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на папку (или подпапку), по которой хотите получить отчёт:")
+    set_state(message.chat.id, STATE_FOLDER_REPORT)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_FOLDER_REPORT)
+@handle_errors
+def folderreport_handler(message: types.Message) -> None:
+    folder_id = extract_folder_id(message.text)
+    if not folder_id:
+        bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или введите /cancel.")
+        return
+
+    rep = get_file_hierarchy(folder_id)
+    bot.reply_to(message, rep)
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+
+# ---- /move ----
+@bot.message_handler(commands=['move'])
+@handle_errors
+def cmd_move(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на файл, который нужно переместить:")
+    set_state(message.chat.id, STATE_MOVE_FILE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_MOVE_FILE)
+@handle_errors
+def move_file_handler(message: types.Message) -> None:
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или /cancel.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+    bot.reply_to(message, "Введите ссылку на целевую папку (или оставьте пустым для корневой):")
+    set_state(message.chat.id, STATE_MOVE_DEST)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_MOVE_DEST)
+@handle_errors
+def move_dest_handler(message: types.Message) -> None:
+    if message.text.strip() == "":
+        dest_id = GOOGLE_ROOT_ID
+    else:
+        dest_id = extract_folder_id(message.text)
+        if not dest_id:
+            bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или /cancel.")
+            return
+    file_id = get_user_data(message.chat.id, 'file_id')
+    try:
+        updated_file = move_file(file_id, dest_id)
+        bot.reply_to(message, f"Файл успешно перемещён. Новые родительские папки: {updated_file.get('parents', [])}")
+        add_change_record(
+            operation="move",
+            file_name=updated_file["name"],
+            file_id=updated_file["id"],
+            source_id="(неизвестно)",
+            dest_id=dest_id,
+            comment="Ручное перемещение через /move"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка при перемещении файла: {e}")
+        bot.reply_to(message, "Произошла ошибка при перемещении файла.")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+
+# ---- /delete ----
+@bot.message_handler(commands=['delete'])
+@handle_errors
+def cmd_delete(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на файл для удаления:")
+    set_state(message.chat.id, STATE_DELETE_FILE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_DELETE_FILE)
+@handle_errors
+def delete_file_handler(message: types.Message) -> None:
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или /cancel.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+
+    # Пример с inline-кнопкой для подтверждения удаления
+    markup = types.InlineKeyboardMarkup()
+    btn_yes = types.InlineKeyboardButton("YES", callback_data="delete_yes")
+    btn_no = types.InlineKeyboardButton("Отмена", callback_data="delete_no")
+    markup.row(btn_yes, btn_no)
+    bot.reply_to(message, "Для подтверждения удаления нажмите кнопку:", reply_markup=markup)
+    set_state(message.chat.id, STATE_DELETE_CONFIRM)
+
+
+@bot.callback_query_handler(func=lambda call: get_state(call.message.chat.id) == STATE_DELETE_CONFIRM)
+@handle_errors
+def delete_confirm_handler(call: types.CallbackQuery) -> None:
+    if call.data == "delete_yes":
+        file_id = get_user_data(call.message.chat.id, 'file_id')
+        try:
+            delete_file(file_id)
+            bot.answer_callback_query(call.id, "Файл успешно удалён.")
+            bot.send_message(call.message.chat.id, "Файл успешно удалён.")
+            add_change_record(
+                operation="delete",
+                file_name="(unknown)",
+                file_id=file_id,
+                comment="Удаление через /delete"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при удалении файла: {e}")
+            bot.answer_callback_query(call.id, "Ошибка при удалении файла.")
+            bot.send_message(call.message.chat.id, "Произошла ошибка при удалении файла.")
+    else:
+        bot.answer_callback_query(call.id, "Удаление отменено.")
+        bot.send_message(call.message.chat.id, "Удаление отменено.")
+    set_state(call.message.chat.id, STATE_NONE)
+    clear_user_data(call.message.chat.id)
+
+
+# ---- /setpermissions ----
+@bot.message_handler(commands=['setpermissions'])
+@handle_errors
+def cmd_setpermissions(message: types.Message) -> None:
+    bot.reply_to(message, "Введите ссылку на файл для изменения прав доступа:")
+    set_state(message.chat.id, STATE_PERM_FILE)
+    clear_user_data(message.chat.id)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_FILE)
+@handle_errors
+def perm_file_handler(message: types.Message) -> None:
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или /cancel.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+    bot.reply_to(message, "Введите email пользователя, которому нужно предоставить доступ:")
+    set_state(message.chat.id, STATE_PERM_EMAIL)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_EMAIL)
+@handle_errors
+def perm_email_handler(message: types.Message) -> None:
+    email = message.text.strip()
+    set_user_data(message.chat.id, 'email', email)
+    bot.reply_to(message, "Введите роль для пользователя (reader, writer, owner):")
+    set_state(message.chat.id, STATE_PERM_ROLE)
+
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_ROLE)
+@handle_errors
+def perm_role_handler(message: types.Message) -> None:
+    role = message.text.strip().lower()
+    if role not in ['reader', 'writer', 'owner']:
+        bot.reply_to(message, "Некорректная роль. Введите одно из: reader, writer, owner:")
+        return
+    file_id = get_user_data(message.chat.id, 'file_id')
+    email = get_user_data(message.chat.id, 'email')
+    try:
+        perm_id = set_file_permission(file_id, email, role)
+        bot.reply_to(message, f"Права доступа успешно изменены. ID созданного разрешения: {perm_id}")
+        add_change_record(
+            operation="setpermissions",
+            file_name="(unknown)",
+            file_id=file_id,
+            comment=f"Изменение прав на {role} для {email}"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка при изменении прав доступа: {e}")
+        bot.reply_to(message, "Произошла ошибка при изменении прав доступа.")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+
+# --- Фоновая задача мониторинга ---
+def check_monitor_tasks() -> None:
+    tasks = load_monitor_tasks()
+    if not tasks:
+        return
+    updated = False
+    for task in tasks:
+        source_id = task["source_folder_id"]
+        dest_id = task["dest_folder_id"]
+        copied_files = task.get("copied_files", [])
+        files = list_files_in_folder(source_id)
+        for f in files:
+            if f["name"] not in copied_files:
+                try:
+                    new_file = copy_file(f["id"], f["name"], dest_id)
+                    copied_files.append(f["name"])
+                    updated = True
+                    logging.info(f"[Мониторинг] Скопирован новый файл: {f['name']}")
+                    add_change_record(
+                        operation="monitor_copy",
+                        file_name=new_file["name"],
+                        file_id=new_file["id"],
+                        source_id=source_id,
+                        dest_id=dest_id,
+                        comment="Автоматическое копирование при мониторинге"
+                    )
+                except Exception as e:
+                    logging.error(f"Ошибка при копировании файла {f['name']}: {e}")
+        task["copied_files"] = copied_files
+    if updated:
+        save_monitor_tasks(tasks)
+
+
+def run_schedule() -> None:
+    schedule.every(6).hours.do(check_monitor_tasks)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+scheduler_thread = threading.Thread(target=run_schedule, daemon=True)
+scheduler_thread.start()
+
+if __name__ == '__main__':
+    # Увеличиваем таймаут для long polling, чтобы уменьшить вероятность ошибок ReadTimeout
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
